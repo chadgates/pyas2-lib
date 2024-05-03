@@ -1018,6 +1018,11 @@ class Mdn:
                 details_status = "original-message-not-found"
                 return status, details_status
 
+            if not orig_message:
+                status = "failed/Failure"
+                details_status = "original-message-not-found"
+                return status, details_status
+
             # Extract the headers and save it
             mdn_headers = {}
             for k, v in self.payload.items():
