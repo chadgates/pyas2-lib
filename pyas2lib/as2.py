@@ -28,6 +28,7 @@ from pyas2lib.constants import (
     DIGEST_ALGORITHMS,
     EDIINT_FEATURES,
     ENCRYPTION_ALGORITHMS,
+    KEY_ENCRYPTION_ALGORITHMS,
     MDN_CONFIRM_TEXT,
     MDN_FAILED_TEXT,
     MDN_MODES,
@@ -241,6 +242,12 @@ class Partner:
             raise ImproperlyConfigured(
                 f"Unsupported Signature Algorithm {self.sign_alg}, "
                 f"must be one of {SIGNATUR_ALGORITHMS}"
+            )
+
+        if self.key_enc_alg and self.key_enc_alg not in KEY_ENCRYPTION_ALGORITHMS:
+            raise ImproperlyConfigured(
+                f"Unsupported Key Encryption Algorithm {self.key_enc_alg}, "
+                f"must be one of {KEY_ENCRYPTION_ALGORITHMS}"
             )
 
     def load_verify_cert(self):
