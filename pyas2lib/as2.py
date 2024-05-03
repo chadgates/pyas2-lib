@@ -31,6 +31,7 @@ from pyas2lib.constants import (
     MDN_CONFIRM_TEXT,
     MDN_FAILED_TEXT,
     MDN_MODES,
+    SIGNATUR_ALGORITHMS,
     SYNCHRONOUS_MDN,
 )
 from pyas2lib.exceptions import (
@@ -234,6 +235,12 @@ class Partner:
             raise ImproperlyConfigured(
                 f"Unsupported MDN Digest Algorithm {self.mdn_digest_alg}, "
                 f"must be one of {DIGEST_ALGORITHMS}"
+            )
+
+        if self.sign_alg and self.sign_alg not in SIGNATUR_ALGORITHMS:
+            raise ImproperlyConfigured(
+                f"Unsupported Signature Algorithm {self.sign_alg}, "
+                f"must be one of {SIGNATUR_ALGORITHMS}"
             )
 
     def load_verify_cert(self):
