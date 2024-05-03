@@ -3,7 +3,7 @@ import hashlib
 import zlib
 from datetime import datetime, timezone
 
-from asn1crypto import cms, core, algos
+from asn1crypto import algos, cms, core
 from asn1crypto.cms import SMIMECapabilityIdentifier
 from oscrypto import asymmetric, symmetric, util
 
