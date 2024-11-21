@@ -920,12 +920,18 @@ class Mdn:
             )
             del signature["MIME-Version"]
 
-            signed_data = sign_message(
-                canonicalize(self.payload),
-                self.digest_alg,
-                message.receiver.sign_key,
-                message.sender.sign_alg,
-            )
+            kwargs = {
+                "data_to_sign": canonicalize(self.payload),
+                "digest_alg": self.digest_alg,
+                "sign_key": message.receiver.sign_key,
+            }
+
+            # Include the sender sign algo only if sender is provided.
+            if message.sender:
+                kwargs["sign_alg"] = message.sender.sign_alg
+
+            signed_data = sign_message(**kwargs)
+
             signature.set_payload(signed_data)
             encoders.encode_base64(signature)
 
