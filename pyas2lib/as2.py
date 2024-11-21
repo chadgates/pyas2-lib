@@ -25,9 +25,11 @@ from pyas2lib.constants import (
     DIGEST_ALGORITHMS,
     EDIINT_FEATURES,
     ENCRYPTION_ALGORITHMS,
+    KEY_ENCRYPTION_ALGORITHMS,
     MDN_CONFIRM_TEXT,
     MDN_FAILED_TEXT,
     MDN_MODES,
+    SIGNATUR_ALGORITHMS,
     SYNCHRONOUS_MDN,
 )
 from pyas2lib.exceptions import (
@@ -179,6 +181,12 @@ class Partner:
 
     :param canonicalize_as_binary: force binary canonicalization for this partner
 
+    :param sign_alg: The signing algorithm to be used for generating the
+        signature. (default `rsassa_pkcs1v15`)
+
+    :param key_enc_alg: The key encryption algorithm to be used.
+        (default `rsaes_pkcs1v15`)
+
     """
 
     as2_name: str
@@ -197,6 +205,8 @@ class Partner:
     mdn_confirm_text: str = MDN_CONFIRM_TEXT
     ignore_self_signed: bool = True
     canonicalize_as_binary: bool = False
+    sign_alg: str = "rsassa_pkcs1v15"
+    key_enc_alg: str = "rsaes_pkcs1v15"
 
     def __post_init__(self):
         """Run the post initialisation checks for this class."""
@@ -223,6 +233,18 @@ class Partner:
             raise ImproperlyConfigured(
                 f"Unsupported MDN Digest Algorithm {self.mdn_digest_alg}, "
                 f"must be one of {DIGEST_ALGORITHMS}"
+            )
+
+        if self.sign_alg and self.sign_alg not in SIGNATUR_ALGORITHMS:
+            raise ImproperlyConfigured(
+                f"Unsupported Signature Algorithm {self.sign_alg}, "
+                f"must be one of {SIGNATUR_ALGORITHMS}"
+            )
+
+        if self.key_enc_alg and self.key_enc_alg not in KEY_ENCRYPTION_ALGORITHMS:
+            raise ImproperlyConfigured(
+                f"Unsupported Key Encryption Algorithm {self.key_enc_alg}, "
+                f"must be one of {KEY_ENCRYPTION_ALGORITHMS}"
             )
 
     def load_verify_cert(self):
@@ -330,6 +352,7 @@ class Message:
         content_type="application/edi-consent",
         additional_headers=None,
         disposition_notification_to="no-reply@pyas2.com",
+        message_id=None,
     ):
 
         """Function builds the AS2 message. Compresses, signs and encrypts
@@ -354,6 +377,10 @@ class Message:
         :param disposition_notification_to:
             Email address for disposition-notification-to header entry.
             (default "no-reply@pyas2.com")
+
+        :param message_id:
+            A value to be used for the left side of the message id. If not provided a
+              unique id is generated. (default None)
         """
 
         # Validations
@@ -372,10 +399,22 @@ class Message:
                 "Encryption of messages is enabled but encrypt key is not set for the receiver."
             )
 
-        # Generate message id using UUID 1 as it uses both hostname and time
-        self.message_id = (
-            email_utils.make_msgid(domain=self.sender.domain).lstrip("<").rstrip(">")
-        )
+        if message_id:
+            self.message_id = f"{message_id}@{self.sender.domain}"
+        else:
+            self.message_id = (
+                email_utils.make_msgid(domain=self.sender.domain)
+                .lstrip("<")
+                .rstrip(">")
+            )
+
+        # ensure the total length of the message id is no more than 255 characters
+        if len(self.message_id) > 255:
+            raise ValueError(
+                "Message ID must be no more than 255 characters for "
+                "compatibility with some AS2 servers. "
+                f"Current message ID length is {len(self.message_id)}."
+            )
 
         # Set up the message headers
         as2_headers = {
@@ -449,7 +488,10 @@ class Message:
             )
             del signature["MIME-Version"]
             signature_data = sign_message(
-                mic_content, self.digest_alg, self.sender.sign_key
+                mic_content,
+                self.digest_alg,
+                self.sender.sign_key,
+                self.receiver.sign_alg,
             )
             signature.set_payload(signature_data)
             encoders.encode_base64(signature)
@@ -542,12 +584,12 @@ class Message:
             when find_partner_cb is provided and find_org_partner_cb is None
 
         :param find_partner_cb:
-            An conditional callback the returns an Partner object if exists. The
+            A conditional callback the returns a Partner object if exists. The
             as2-from header value is passed as an argument to it. Must be provided
             when find_org_cb is provided and find_org_partner_cb is None.
 
         :param find_message_cb:
-            An optional callback the returns an Message object if exists in
+            An optional callback the returns a Message object if exists in
             order to check for duplicates. The message id and partner id is
             passed as arguments to it.
 
@@ -591,10 +633,9 @@ class Message:
             # Get the organization and partner for this transmission
             org_id = unquote_as2name(as2_headers["as2-to"])
             partner_id = unquote_as2name(as2_headers["as2-from"])
-
             if find_org_partner_cb:
                 self.receiver, self.sender = find_org_partner_cb(org_id, partner_id)
-            else:
+            elif find_org_cb and find_partner_cb:
                 self.receiver = find_org_cb(org_id)
                 self.sender = find_partner_cb(partner_id)
 
@@ -880,7 +921,10 @@ class Mdn:
             del signature["MIME-Version"]
 
             signed_data = sign_message(
-                canonicalize(self.payload), self.digest_alg, message.receiver.sign_key
+                canonicalize(self.payload),
+                self.digest_alg,
+                message.receiver.sign_key,
+                message.sender.sign_alg,
             )
             signature.set_payload(signed_data)
             encoders.encode_base64(signature)
