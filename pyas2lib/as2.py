@@ -399,8 +399,15 @@ class Message:
                 "Encryption of messages is enabled but encrypt key is not set for the receiver."
             )
 
-        if message_id:
+        if message_id and "@" in message_id:
+            self.message_id = message_id
+        elif message_id and self.sender.domain:
             self.message_id = f"{message_id}@{self.sender.domain}"
+        elif message_id:
+            raise ValueError(
+                f"Message ID {message_id} was passed, but it did not contain "
+                "a domain name, nor did the sender have a domain name"
+            )
         else:
             self.message_id = (
                 email_utils.make_msgid(domain=self.sender.domain)
