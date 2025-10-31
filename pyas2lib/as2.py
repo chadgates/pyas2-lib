@@ -636,23 +636,19 @@ class Message:
             partner_id = unquote_as2name(as2_headers["as2-from"])
 
             if find_org_partner_cb:
-                if inspect.iscoroutinefunction(find_org_partner_cb):
-                    self.receiver, self.sender = await find_org_partner_cb(
-                        org_id, partner_id
-                    )
-                else:
-                    self.receiver, self.sender = find_org_partner_cb(org_id, partner_id)
+                result = find_org_partner_cb(org_id, partner_id)
+                if inspect.isawaitable(result):
+                    result = await result
+                self.receiver, self.sender = result
 
             elif find_org_cb and find_partner_cb:
-                if inspect.iscoroutinefunction(find_org_cb):
-                    self.receiver = await find_org_cb(org_id)
-                else:
-                    self.receiver = find_org_cb(org_id)
+                self.receiver = find_org_cb(org_id)
+                if inspect.isawaitable(self.receiver):
+                    self.receiver = await self.receiver
 
-                if inspect.iscoroutinefunction(find_partner_cb):
-                    self.sender = await find_partner_cb(partner_id)
-                else:
-                    self.sender = find_partner_cb(partner_id)
+                self.sender = find_partner_cb(partner_id)
+                if inspect.isawaitable(self.sender):
+                    self.sender = await self.sender
 
             if not self.receiver:
                 raise PartnerNotFound(f"Unknown AS2 organization with id {org_id}")
@@ -661,10 +657,10 @@ class Message:
                 raise PartnerNotFound(f"Unknown AS2 partner with id {partner_id}")
 
             if find_message_cb:
-                if inspect.iscoroutinefunction(find_message_cb):
-                    message_exists = await find_message_cb(self.message_id, partner_id)
-                else:
-                    message_exists = find_message_cb(self.message_id, partner_id)
+                message_exists = find_message_cb(self.message_id, partner_id)
+                if inspect.isawaitable(message_exists):
+                    message_exists = await message_exists
+
                 if message_exists:
                     raise DuplicateDocument(
                         "Duplicate message received, message with this ID already processed."
@@ -1003,18 +999,9 @@ class Mdn:
             self.payload = parse_mime(raw_content)
             self.orig_message_id, orig_recipient = self.detect_mdn()
 
-            # Call the find message callback which should return a Message instance
-            if inspect.iscoroutinefunction(find_message_cb):
-                orig_message = await find_message_cb(
-                    self.orig_message_id, orig_recipient
-                )
-            else:
-                orig_message = find_message_cb(self.orig_message_id, orig_recipient)
-
-            if not orig_message:
-                status = "failed/Failure"
-                details_status = "original-message-not-found"
-                return status, details_status
+            orig_message = find_message_cb(self.orig_message_id, orig_recipient)
+            if inspect.isawaitable(orig_message):
+                orig_message = await orig_message
 
             if not orig_message:
                 status = "failed/Failure"
