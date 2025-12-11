@@ -65,8 +65,12 @@ async def _call_callback(callback, *args):
 
     Handles three scenarios:
     1. Sync callback called from async context (aparse called directly)
+       - Runs in a thread to avoid blocking and to support sync-only
+         operations like Django ORM
     2. Sync callback called from sync context (via parse -> aparse)
+       - Runs in a thread (same as above, since we're still in async context)
     3. Async callback called from async context (aparse called directly)
+       - Awaits the coroutine directly
 
     :param callback: The callback function (sync or async)
     :param args: Arguments to pass to the callback
@@ -75,14 +79,13 @@ async def _call_callback(callback, *args):
     if callback is None:
         return None
 
-    result = callback(*args)
+    # Check if the callback is a coroutine function (async def)
+    if inspect.iscoroutinefunction(callback):
+        return await callback(*args)
 
-    # If the result is a coroutine or awaitable, await it
-    if inspect.isawaitable(result):
-        return await result
-
-    # If it's a sync function result, just return it
-    return result
+    # For sync functions, run in a thread to avoid blocking the event loop
+    # and to support sync-only operations (like Django ORM)
+    return await asyncio.to_thread(callback, *args)
 
 
 @dataclass
