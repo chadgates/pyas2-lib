@@ -1,8 +1,6 @@
 """Define the core functions/classes of the pyas2 package."""
-import asyncio
 import binascii
 import hashlib
-import inspect
 import logging
 import traceback
 from dataclasses import dataclass
@@ -57,58 +55,6 @@ from pyas2lib.utils import (
 )
 
 logger = logging.getLogger("pyas2lib")
-
-
-def _is_event_loop_running_in_main_thread():
-    """Check if an event loop is running in the main thread."""
-    try:
-        loop = asyncio.get_running_loop()
-        # Check if loop is running in main thread
-        import threading
-
-        return threading.current_thread() is threading.main_thread()
-    except RuntimeError:
-        return False
-
-
-async def _call_callback(callback, *args):
-    """
-    Helper to call a callback that may be sync or async.
-
-    Handles three scenarios:
-    1. Sync callback called from async context (aparse called directly)
-       - If event loop is running in main thread, runs callback in a thread
-         to support sync-only operations like Django ORM
-       - Otherwise, calls directly (e.g., when parse() uses asyncio.run())
-    2. Sync callback called from sync context (via parse -> aparse)
-       - Calls the callback directly since asyncio.run() creates a new
-         event loop that doesn't conflict with sync operations
-    3. Async callback called from async context (aparse called directly)
-       - Awaits the coroutine directly
-
-    :param callback: The callback function (sync or async)
-    :param args: Arguments to pass to the callback
-    :return: The result of the callback
-    """
-    if callback is None:
-        return None
-
-    # Check if the callback is a coroutine function (async def)
-    if inspect.iscoroutinefunction(callback):
-        return await callback(*args)
-
-    # For sync functions, check if we need to run in a thread
-    # We need to_thread when an async framework (like Django async views)
-    # is running the event loop and calling aparse directly
-    if _is_event_loop_running_in_main_thread():
-        # Event loop running in main thread means we're likely in an async
-        # framework context (Django async view, FastAPI, etc.)
-        # Run sync callback in thread to avoid blocking and allow sync DB ops
-        return await asyncio.to_thread(callback, *args)
-
-    # Event loop is not in main thread (e.g., asyncio.run() from parse())
-    # Safe to call sync callback directly
-    return callback(*args)
 
 
 @dataclass
@@ -626,83 +572,90 @@ class Message:
 
         return False, payload
 
-    async def aparse(
-        self,
-        raw_content,
-        find_org_cb=None,
-        find_partner_cb=None,
-        find_message_cb=None,
-        find_org_partner_cb=None,
-    ):
-        """Function parses the RAW AS2 message; decrypts, verifies and
-        decompresses it and extracts the payload.
+    @staticmethod
+    def extract_headers(raw_content):
+        """Extract AS2 headers from raw content without full parsing.
+
+        This is Phase 1 of the phased parsing approach. Use this to get
+        org_id and partner_id for lookup before calling parse_message().
 
         :param raw_content:
             A byte string of the received HTTP headers followed by the body.
 
-        :param find_org_cb:
-            A conditional callback the returns an Organization object if exists. The
-            as2-to header value is passed as an argument to it. Must be provided
-            when find_partner_cb is provided and find_org_partner_cb is None
+        :return:
+            A dict with 'org_id', 'partner_id', 'message_id', 'as2_headers', and 'payload'.
+        """
+        payload = parse_mime(raw_content)
+        as2_headers = {}
+        message_id = None
 
-        :param find_partner_cb:
-            A conditional callback the returns a Partner object if exists. The
-            as2-from header value is passed as an argument to it. Must be provided
-            when find_org_cb is provided and find_org_partner_cb is None.
+        for k, v in payload.items():
+            k_lower = k.lower()
+            if k_lower == "message-id":
+                message_id = v.lstrip("<").rstrip(">")
+            as2_headers[k_lower] = v
 
-        :param find_message_cb:
-            An optional callback the returns a Message object if exists in
-            order to check for duplicates. The message id and partner id is
-            passed as arguments to it.
+        org_id = unquote_as2name(as2_headers.get("as2-to", ""))
+        partner_id = unquote_as2name(as2_headers.get("as2-from", ""))
 
-        :param find_org_partner_cb:
-            A conditional callback that return Organization object and
-            Partner object if exist. The as2-to and as2-from header value
-            are passed as an argument to it. Must be provided
-            when find_org_cb and find_org_partner_cb is None.
+        return {
+            "org_id": org_id,
+            "partner_id": partner_id,
+            "message_id": message_id,
+            "as2_headers": as2_headers,
+            "payload": payload,
+        }
+
+    def parse_message(self, raw_content, is_duplicate=False, _headers=None):
+        """Parse the AS2 message after org/partner have been set.
+
+        This is Phase 2 of the phased parsing approach. Before calling this,
+        set self.sender and self.receiver, and optionally check for duplicates.
+
+        For async applications:
+            # Phase 1: Extract headers
+            headers = Message.extract_headers(raw_content)
+
+            # Phase 2: Lookup org/partner and check duplicate (async in your code)
+            org, partner = await my_async_lookup(headers['org_id'], headers['partner_id'])
+            is_dup = await my_async_check_duplicate(headers['message_id'], headers['partner_id'])
+
+            # Phase 3: Parse message
+            message = Message(sender=partner, receiver=org)
+            status, exception, mdn = message.parse_message(raw_content, is_duplicate=is_dup)
+
+        :param raw_content:
+            A byte string of the received HTTP headers followed by the body.
+
+        :param is_duplicate:
+            Boolean indicating if the message is a duplicate. If True, raises
+            DuplicateDocument exception. Default is False.
+
+        :param _headers:
+            Internal parameter. Pre-extracted headers from extract_headers() to
+            avoid re-parsing. If not provided, headers will be extracted from
+            raw_content.
 
         :return:
-            A three element tuple containing (status, (exception, traceback)
-            , mdn). The status is a string indicating the status of the
+            A three element tuple containing (status, (exception, traceback),
+            mdn). The status is a string indicating the status of the
             transaction. The exception is populated with any exception raised
             during processing and the mdn is an MDN object or None in case
             the partner did not request it.
         """
-
-        # Validate passed arguments
-        if not any(
-            [
-                find_org_cb and find_partner_cb and not find_org_partner_cb,
-                find_org_partner_cb and not find_partner_cb and not find_org_cb,
-            ]
-        ):
-            raise TypeError(
-                "Incorrect arguments passed: either find_org_cb and find_partner_cb "
-                "or only find_org_partner_cb must be passed."
-            )
-
-        # Parse the raw MIME message and extract its content and headers
         status, detailed_status, exception, mdn = "processed", None, (None, None), None
-        self.payload = parse_mime(raw_content)
-        as2_headers = {}
-        for k, v in self.payload.items():
-            k = k.lower()
-            if k == "message-id":
-                self.message_id = v.lstrip("<").rstrip(">")
-            as2_headers[k] = v
+
+        # Use pre-extracted headers if provided, otherwise extract them
+        if _headers is None:
+            _headers = self.extract_headers(raw_content)
+
+        self.payload = _headers["payload"]
+        self.message_id = _headers["message_id"]
+        as2_headers = _headers["as2_headers"]
+        org_id = _headers["org_id"]
+        partner_id = _headers["partner_id"]
 
         try:
-            # Get the organization and partner for this transmission
-            org_id = unquote_as2name(as2_headers["as2-to"])
-            partner_id = unquote_as2name(as2_headers["as2-from"])
-
-            if find_org_partner_cb:
-                result = await _call_callback(find_org_partner_cb, org_id, partner_id)
-                self.receiver, self.sender = result
-
-            elif find_org_cb and find_partner_cb:
-                self.receiver = await _call_callback(find_org_cb, org_id)
-                self.sender = await _call_callback(find_partner_cb, partner_id)
 
             if not self.receiver:
                 raise PartnerNotFound(f"Unknown AS2 organization with id {org_id}")
@@ -710,14 +663,11 @@ class Message:
             if not self.sender:
                 raise PartnerNotFound(f"Unknown AS2 partner with id {partner_id}")
 
-            if find_message_cb:
-                message_exists = await _call_callback(
-                    find_message_cb, self.message_id, partner_id
+            # Check for duplicate message
+            if is_duplicate:
+                raise DuplicateDocument(
+                    "Duplicate message received, message with this ID already processed."
                 )
-                if message_exists:
-                    raise DuplicateDocument(
-                        "Duplicate message received, message with this ID already processed."
-                    )
 
             if (
                 self.sender.encrypt
@@ -838,22 +788,83 @@ class Message:
 
         return status, exception, mdn
 
-    def parse(self, *args, **kwargs):
-        """
-        A synchronous wrapper for the asynchronous parse method.
-        It runs the parse coroutine in an event loop and returns the result.
-        """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+    def parse(
+        self,
+        raw_content,
+        find_org_cb=None,
+        find_partner_cb=None,
+        find_message_cb=None,
+        find_org_partner_cb=None,
+    ):
+        """Function parses the RAW AS2 message; decrypts, verifies and
+        decompresses it and extracts the payload.
 
-        if loop and loop.is_running():
-            raise RuntimeError(
-                "Cannot run synchronous parse within an already running event loop, use aparse."
+        This is the original synchronous API maintained for backward compatibility.
+        For async applications, use extract_headers() + parse_message() instead.
+
+        :param raw_content:
+            A byte string of the received HTTP headers followed by the body.
+
+        :param find_org_cb:
+            A callback that returns an Organization object if exists. The
+            as2-to header value is passed as an argument to it. Must be provided
+            when find_partner_cb is provided and find_org_partner_cb is None.
+
+        :param find_partner_cb:
+            A callback that returns a Partner object if exists. The
+            as2-from header value is passed as an argument to it. Must be provided
+            when find_org_cb is provided and find_org_partner_cb is None.
+
+        :param find_message_cb:
+            An optional callback that returns a Message object if exists in
+            order to check for duplicates. The message id and partner id is
+            passed as arguments to it.
+
+        :param find_org_partner_cb:
+            A callback that returns Organization object and Partner object
+            if exist. The as2-to and as2-from header value are passed as
+            arguments to it. Must be provided when find_org_cb and
+            find_partner_cb are None.
+
+        :return:
+            A three element tuple containing (status, (exception, traceback),
+            mdn). The status is a string indicating the status of the
+            transaction. The exception is populated with any exception raised
+            during processing and the mdn is an MDN object or None in case
+            the partner did not request it.
+        """
+        # Validate passed arguments
+        if not any(
+            [
+                find_org_cb and find_partner_cb and not find_org_partner_cb,
+                find_org_partner_cb and not find_partner_cb and not find_org_cb,
+            ]
+        ):
+            raise TypeError(
+                "Incorrect arguments passed: either find_org_cb and find_partner_cb "
+                "or only find_org_partner_cb must be passed."
             )
 
-        return asyncio.run(self.aparse(*args, **kwargs))
+        # Phase 1: Extract headers
+        headers = self.extract_headers(raw_content)
+        org_id = headers["org_id"]
+        partner_id = headers["partner_id"]
+        message_id = headers["message_id"]
+
+        # Phase 2: Lookup org/partner using sync callbacks
+        if find_org_partner_cb:
+            self.receiver, self.sender = find_org_partner_cb(org_id, partner_id)
+        else:
+            self.receiver = find_org_cb(org_id)
+            self.sender = find_partner_cb(partner_id)
+
+        # Check for duplicate using sync callback
+        is_duplicate = False
+        if find_message_cb:
+            is_duplicate = bool(find_message_cb(message_id, partner_id))
+
+        # Phase 3: Parse message (pass headers to avoid re-parsing)
+        return self.parse_message(raw_content, is_duplicate=is_duplicate, _headers=headers)
 
 class Mdn:
     """Class for handling AS2 MDNs. Includes functions for both
@@ -1038,17 +1049,80 @@ class Mdn:
             f"content:\n {mime_to_bytes(self.payload)}"
         )
 
-    async def aparse(self, raw_content, find_message_cb):
-        """Function parses the RAW AS2 MDN, verifies it and extracts the
-        processing status of the orginal AS2 message.
+    @staticmethod
+    def extract_headers(raw_content):
+        """Extract MDN headers from raw content without full parsing.
+
+        This is Phase 1 of the phased parsing approach. Use this to get
+        orig_message_id and orig_recipient for lookup before calling parse_mdn().
 
         :param raw_content:
             A byte string of the received HTTP headers followed by the body.
 
-        :param find_message_cb:
-            A callback the must returns the original Message Object. The
-            original message-id and original recipient AS2 ID are passed
-            as arguments to it.
+        :return:
+            A dict with 'orig_message_id' and 'orig_recipient'.
+        """
+        payload = parse_mime(raw_content)
+
+        # Detect MDN message
+        mdn_message = None
+        if payload.get_content_type() == "multipart/report":
+            mdn_message = payload
+        elif payload.get_content_type() == "multipart/signed":
+            for part in payload.walk():
+                if part.get_content_type() == "multipart/report":
+                    mdn_message = payload
+
+        if not mdn_message:
+            raise MDNNotFound("No MDN found in the received message")
+
+        orig_message_id, orig_recipient = None, None
+        for part in mdn_message.walk():
+            if part.get_content_type() == "message/disposition-notification":
+                mdn = part.get_payload()[0]
+                orig_message_id = mdn.get("Original-Message-ID").strip("<>")
+                if "Original-Recipient" in mdn:
+                    recipient = mdn["Original-Recipient"]
+                    if ";" in recipient:
+                        orig_recipient = recipient.split(";")[1].strip()
+                    else:
+                        orig_recipient = recipient.strip()
+                elif "Final-Recipient" in mdn:
+                    recipient = mdn["Final-Recipient"]
+                    if ";" in recipient:
+                        orig_recipient = recipient.split(";")[1].strip()
+                    else:
+                        orig_recipient = recipient.strip()
+
+        return {
+            "orig_message_id": orig_message_id,
+            "orig_recipient": orig_recipient,
+        }
+
+    def parse_mdn(self, raw_content, orig_message):
+        """Parse the MDN after the original message has been looked up.
+
+        This is Phase 2 of the phased parsing approach. Before calling this,
+        look up the original message using extract_headers().
+
+        For async applications:
+            # Phase 1: Extract headers
+            headers = Mdn.extract_headers(raw_content)
+
+            # Phase 2: Lookup original message (async in your code)
+            orig_message = await my_async_lookup(
+                headers['orig_message_id'], headers['orig_recipient']
+            )
+
+            # Phase 3: Parse MDN
+            mdn = Mdn()
+            status, detailed_status = mdn.parse_mdn(raw_content, orig_message)
+
+        :param raw_content:
+            A byte string of the received HTTP headers followed by the body.
+
+        :param orig_message:
+            The original Message object, or None if not found.
 
         :returns:
             A two element tuple containing (status, detailed_status). The
@@ -1056,19 +1130,16 @@ class Mdn:
             optional detailed_status gives additional information about the
             processing status.
         """
-
         status, detailed_status = None, None
+
         try:
             self.payload = parse_mime(raw_content)
-            self.orig_message_id, orig_recipient = self.detect_mdn()
+            self.orig_message_id, _ = self.detect_mdn()
 
-            orig_message = await _call_callback(
-                find_message_cb, self.orig_message_id, orig_recipient
-            )
             if not orig_message:
                 status = "failed/Failure"
-                details_status = "original-message-not-found"
-                return status, details_status
+                detailed_status = "original-message-not-found"
+                return status, detailed_status
 
             # Extract the headers and save it
             mdn_headers = {}
@@ -1144,24 +1215,43 @@ class Mdn:
             status = "failed/Failure"
             detailed_status = f"Failed to parse received MDN. {e}"
             logger.error(f"Failed to parse AS2 MDN\n: {traceback.format_exc()}")
+
         return status, detailed_status
 
-    def parse(self, *args, **kwargs):
-        """
-        A synchronous wrapper for the asynchronous parse method.
-        It runs the parse coroutine in an event loop and returns the result.
+    def parse(self, raw_content, find_message_cb):
+        """Function parses the RAW AS2 MDN, verifies it and extracts the
+        processing status of the original AS2 message.
+
+        This is the original synchronous API maintained for backward compatibility.
+        For async applications, use extract_headers() + parse_mdn() instead.
+
+        :param raw_content:
+            A byte string of the received HTTP headers followed by the body.
+
+        :param find_message_cb:
+            A callback that returns the original Message Object. The
+            original message-id and original recipient AS2 ID are passed
+            as arguments to it.
+
+        :returns:
+            A two element tuple containing (status, detailed_status). The
+            status is a string indicating the status of the transaction. The
+            optional detailed_status gives additional information about the
+            processing status.
         """
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+            # Phase 1: Extract headers
+            headers = self.extract_headers(raw_content)
+        except MDNNotFound:
+            return "failed/Failure", "mdn-not-found"
 
-        if loop and loop.is_running():
-            raise RuntimeError(
-                "Cannot run synchronous parse within an already running event loop, use aparse."
-            )
+        # Phase 2: Lookup original message using sync callback
+        orig_message = find_message_cb(
+            headers["orig_message_id"], headers["orig_recipient"]
+        )
 
-        return asyncio.run(self.aparse(*args, **kwargs))
+        # Phase 3: Parse MDN
+        return self.parse_mdn(raw_content, orig_message)
 
     def detect_mdn(self):
         """Function checks if the received raw message is an AS2 MDN or not.

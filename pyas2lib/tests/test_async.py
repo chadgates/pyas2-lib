@@ -28,42 +28,29 @@ partner = as2.Partner(
 )
 
 
-async def afind_org(headers):
+def find_org(as2_id):
     return org
 
 
-async def afind_partner(headers):
+def find_partner(as2_id):
     return partner
 
 
-async def afind_duplicate_message(message_id, message_recipient):
-    return True
-
-
-async def afind_org_partner(as2_org, as2_partner):
+def find_org_partner(org_id, partner_id):
     return org, partner
 
 
-# Sync callbacks for testing sync callbacks in async context
-def sync_find_org(headers):
-    return org
-
-
-def sync_find_partner(headers):
-    return partner
-
-
-def sync_find_message(message_id, message_recipient):
+def find_message(message_id, message_recipient):
     return None
 
 
-def sync_find_org_partner(as2_org, as2_partner):
-    return org, partner
+def find_duplicate_message(message_id, message_recipient):
+    return True
 
 
 @pytest.mark.asyncio
-async def test_async_callbacks_with_duplicate_message():
-    """Test case where async callbacks are used and a duplicate message is sent to the partner"""
+async def test_phased_parsing_with_async_lookup():
+    """Test the phased parsing approach with async lookup simulation"""
 
     # Build an As2 message to be transmitted to partner
     partner.sign = True
@@ -72,146 +59,187 @@ async def test_async_callbacks_with_duplicate_message():
     out_message = as2.Message(org, partner)
     out_message.build(test_data)
 
-    async def afind_message(message_id, message_recipient):
+    raw_out_message = out_message.headers_str + b"\r\n" + out_message.content
+
+    # Phase 1: Extract headers (can be done anywhere)
+    # Note: The message was built by org and sent to partner
+    # So as2-from = org (some_organization), as2-to = partner (some_partner)
+    # From the receiver's perspective:
+    #   org_id (from as2-to) = the receiving organization = some_partner
+    #   partner_id (from as2-from) = the sending partner = some_organization
+    headers = as2.Message.extract_headers(raw_out_message)
+    assert headers["org_id"] == "some_partner"  # as2-to
+    assert headers["partner_id"] == "some_organization"  # as2-from
+    assert headers["message_id"] is not None
+
+    # Phase 2: Async lookup simulation (this is where you'd use await)
+    async def async_lookup(org_id, partner_id):
+        # Simulate async database lookup
+        return org, partner
+
+    receiver, sender = await async_lookup(headers["org_id"], headers["partner_id"])
+
+    # Phase 3: Parse message with org/partner already set
+    in_message = as2.Message(sender=sender, receiver=receiver)
+    status, exception, mdn = in_message.parse_message(raw_out_message)
+
+    assert status == "processed"
+    assert in_message.signed
+    assert in_message.encrypted
+
+    # Also test MDN parsing with phased approach
+    mdn_raw = mdn.headers_str + b"\r\n" + mdn.content
+
+    # Phase 1: Extract MDN headers
+    mdn_headers = as2.Mdn.extract_headers(mdn_raw)
+    assert mdn_headers["orig_message_id"] == out_message.message_id
+
+    # Phase 2: Async lookup for original message
+    async def async_find_message(message_id, recipient):
         return out_message
 
-    # Parse the generated AS2 message as the partner
-    raw_out_message = out_message.headers_str + b"\r\n" + out_message.content
-    in_message = as2.Message()
-    _, _, mdn = await in_message.aparse(
-        raw_out_message,
-        find_org_cb=afind_org,
-        find_partner_cb=afind_partner,
-        find_message_cb=afind_duplicate_message,
+    orig_msg = await async_find_message(
+        mdn_headers["orig_message_id"], mdn_headers["orig_recipient"]
     )
 
+    # Phase 3: Parse MDN
     out_mdn = as2.Mdn()
-    status, detailed_status = await out_mdn.aparse(
-        mdn.headers_str + b"\r\n" + mdn.content,
-        find_message_cb=afind_message,
-    )
-    assert status == "processed/Warning"
-    assert detailed_status == "duplicate-document"
+    mdn_status, detailed_status = out_mdn.parse_mdn(mdn_raw, orig_msg)
+    assert mdn_status == "processed"
 
 
 @pytest.mark.asyncio
-async def test_async_partnership():
-    """Test Async Partnership callback"""
+async def test_phased_parsing_duplicate_check():
+    """Test the phased parsing with duplicate detection"""
 
-    # Build an As2 message to be transmitted to partner
-    out_message = as2.Message(org, partner)
-    out_message.build(test_data)
-    raw_out_message = out_message.headers_str + b"\r\n" + out_message.content
-
-    # Parse the generated AS2 message as the partner
-    in_message = as2.Message()
-    status, _, _ = await in_message.aparse(
-        raw_out_message, find_org_partner_cb=afind_org_partner
-    )
-
-    # Compare contents of the input and output messages
-    assert status == "processed"
-
-
-@pytest.mark.asyncio
-async def test_runtime_error():
-    """Test to get Runtime error when calling parse instead of aparse from Async Context"""
-
-    with pytest.raises(
-        RuntimeError,
-        match="Cannot run synchronous parse within an already running event loop, use aparse.",
-    ):
-        out_message = as2.Message(org, partner)
-        out_message.build(test_data)
-        raw_out_message = out_message.headers_str + b"\r\n" + out_message.content
-
-        in_message = as2.Message()
-        status, _, _ = in_message.parse(
-            raw_out_message, find_org_partner_cb=afind_org_partner
-        )
-
-    with pytest.raises(
-        RuntimeError,
-        match="Cannot run synchronous parse within an already running event loop, use aparse.",
-    ):
-        partner.sign = True
-        partner.encrypt = True
-        partner.mdn_mode = as2.SYNCHRONOUS_MDN
-        out_message = as2.Message(org, partner)
-        out_message.build(test_data)
-
-        # Parse the generated AS2 message as the partner
-        raw_out_message = out_message.headers_str + b"\r\n" + out_message.content
-        in_message = as2.Message()
-        _, _, mdn = await in_message.aparse(
-            raw_out_message,
-            find_org_cb=afind_org,
-            find_partner_cb=afind_partner,
-            find_message_cb=afind_duplicate_message,
-        )
-
-        out_mdn = as2.Mdn()
-        _, _ = out_mdn.parse(
-            mdn.headers_str + b"\r\n" + mdn.content,
-            find_message_cb=afind_duplicate_message,
-        )
-
-
-@pytest.mark.asyncio
-async def test_sync_callbacks_in_async_context():
-    """Test that sync callbacks work correctly when called from aparse (async context)"""
-
-    # Build an As2 message to be transmitted to partner
     partner.sign = True
     partner.encrypt = True
     partner.mdn_mode = as2.SYNCHRONOUS_MDN
     out_message = as2.Message(org, partner)
     out_message.build(test_data)
 
-    # Parse the generated AS2 message as the partner using SYNC callbacks in async context
     raw_out_message = out_message.headers_str + b"\r\n" + out_message.content
+
+    # Extract headers
+    headers = as2.Message.extract_headers(raw_out_message)
+
+    # Async lookup
+    async def async_lookup(org_id, partner_id):
+        return org, partner
+
+    receiver, sender = await async_lookup(headers["org_id"], headers["partner_id"])
+
+    # Async duplicate check
+    async def async_check_duplicate(message_id, partner_id):
+        return True  # Simulate duplicate found
+
+    is_duplicate = await async_check_duplicate(
+        headers["message_id"], headers["partner_id"]
+    )
+
+    # Parse message with duplicate flag
+    in_message = as2.Message(sender=sender, receiver=receiver)
+    status, exception, mdn = in_message.parse_message(
+        raw_out_message, is_duplicate=is_duplicate
+    )
+
+    assert status == "processed/Warning"
+    assert "duplicate-document" in exception[0].disposition_modifier
+
+
+def test_sync_parse_still_works():
+    """Test that the original sync parse() API still works"""
+
+    partner.sign = True
+    partner.encrypt = True
+    partner.mdn_mode = as2.SYNCHRONOUS_MDN
+    out_message = as2.Message(org, partner)
+    out_message.build(test_data)
+
+    raw_out_message = out_message.headers_str + b"\r\n" + out_message.content
+
+    # Use original sync API with callbacks
     in_message = as2.Message()
-    status, _, mdn = await in_message.aparse(
+    status, exception, mdn = in_message.parse(
         raw_out_message,
-        find_org_cb=sync_find_org,
-        find_partner_cb=sync_find_partner,
-        find_message_cb=sync_find_message,
+        find_org_cb=find_org,
+        find_partner_cb=find_partner,
+        find_message_cb=find_message,
     )
 
     assert status == "processed"
     assert in_message.signed
     assert in_message.encrypted
 
-    # Also test MDN parsing with sync callback
-    def sync_find_orig_message(message_id, message_recipient):
-        return out_message
 
-    out_mdn = as2.Mdn()
-    mdn_status, detailed_status = await out_mdn.aparse(
-        mdn.headers_str + b"\r\n" + mdn.content,
-        find_message_cb=sync_find_orig_message,
-    )
-    assert mdn_status == "processed"
+def test_sync_parse_with_partnership_callback():
+    """Test sync parse with find_org_partner_cb"""
 
-
-@pytest.mark.asyncio
-async def test_sync_partnership_callback_in_async_context():
-    """Test that sync find_org_partner_cb works correctly when called from aparse"""
-
-    # Build an As2 message to be transmitted to partner
     partner.sign = False
     partner.encrypt = False
     partner.mdn_mode = None
     out_message = as2.Message(org, partner)
     out_message.build(test_data)
+
     raw_out_message = out_message.headers_str + b"\r\n" + out_message.content
 
-    # Parse the generated AS2 message using SYNC callback in async context
     in_message = as2.Message()
-    status, _, _ = await in_message.aparse(
-        raw_out_message, find_org_partner_cb=sync_find_org_partner
+    status, exception, mdn = in_message.parse(
+        raw_out_message,
+        find_org_partner_cb=find_org_partner,
     )
 
-    # Compare contents of the input and output messages
     assert status == "processed"
     assert in_message.content == test_data
+
+
+def test_sync_parse_duplicate_message():
+    """Test sync parse with duplicate message detection"""
+
+    partner.sign = True
+    partner.encrypt = True
+    partner.mdn_mode = as2.SYNCHRONOUS_MDN
+    out_message = as2.Message(org, partner)
+    out_message.build(test_data)
+
+    raw_out_message = out_message.headers_str + b"\r\n" + out_message.content
+
+    in_message = as2.Message()
+    status, exception, mdn = in_message.parse(
+        raw_out_message,
+        find_org_cb=find_org,
+        find_partner_cb=find_partner,
+        find_message_cb=find_duplicate_message,
+    )
+
+    assert status == "processed/Warning"
+    assert "duplicate-document" in exception[0].disposition_modifier
+
+
+def test_sync_mdn_parse():
+    """Test sync MDN parse"""
+
+    partner.sign = True
+    partner.encrypt = True
+    partner.mdn_mode = as2.SYNCHRONOUS_MDN
+    out_message = as2.Message(org, partner)
+    out_message.build(test_data)
+
+    raw_out_message = out_message.headers_str + b"\r\n" + out_message.content
+
+    in_message = as2.Message()
+    status, exception, mdn = in_message.parse(
+        raw_out_message,
+        find_org_cb=find_org,
+        find_partner_cb=find_partner,
+    )
+
+    def find_orig_message(message_id, recipient):
+        return out_message
+
+    out_mdn = as2.Mdn()
+    mdn_status, detailed_status = out_mdn.parse(
+        mdn.headers_str + b"\r\n" + mdn.content,
+        find_message_cb=find_orig_message,
+    )
+    assert mdn_status == "processed"
