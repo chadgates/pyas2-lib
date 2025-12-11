@@ -59,6 +59,32 @@ from pyas2lib.utils import (
 logger = logging.getLogger("pyas2lib")
 
 
+async def _call_callback(callback, *args):
+    """
+    Helper to call a callback that may be sync or async.
+
+    Handles three scenarios:
+    1. Sync callback called from async context (aparse called directly)
+    2. Sync callback called from sync context (via parse -> aparse)
+    3. Async callback called from async context (aparse called directly)
+
+    :param callback: The callback function (sync or async)
+    :param args: Arguments to pass to the callback
+    :return: The result of the callback
+    """
+    if callback is None:
+        return None
+
+    result = callback(*args)
+
+    # If the result is a coroutine or awaitable, await it
+    if inspect.isawaitable(result):
+        return await result
+
+    # If it's a sync function result, just return it
+    return result
+
+
 @dataclass
 class Organization:
     """
@@ -645,19 +671,12 @@ class Message:
             partner_id = unquote_as2name(as2_headers["as2-from"])
 
             if find_org_partner_cb:
-                result = find_org_partner_cb(org_id, partner_id)
-                if inspect.isawaitable(result):
-                    result = await result
+                result = await _call_callback(find_org_partner_cb, org_id, partner_id)
                 self.receiver, self.sender = result
 
             elif find_org_cb and find_partner_cb:
-                self.receiver = find_org_cb(org_id)
-                if inspect.isawaitable(self.receiver):
-                    self.receiver = await self.receiver
-
-                self.sender = find_partner_cb(partner_id)
-                if inspect.isawaitable(self.sender):
-                    self.sender = await self.sender
+                self.receiver = await _call_callback(find_org_cb, org_id)
+                self.sender = await _call_callback(find_partner_cb, partner_id)
 
             if not self.receiver:
                 raise PartnerNotFound(f"Unknown AS2 organization with id {org_id}")
@@ -666,10 +685,9 @@ class Message:
                 raise PartnerNotFound(f"Unknown AS2 partner with id {partner_id}")
 
             if find_message_cb:
-                message_exists = find_message_cb(self.message_id, partner_id)
-                if inspect.isawaitable(message_exists):
-                    message_exists = await message_exists
-
+                message_exists = await _call_callback(
+                    find_message_cb, self.message_id, partner_id
+                )
                 if message_exists:
                     raise DuplicateDocument(
                         "Duplicate message received, message with this ID already processed."
@@ -1018,10 +1036,9 @@ class Mdn:
             self.payload = parse_mime(raw_content)
             self.orig_message_id, orig_recipient = self.detect_mdn()
 
-            orig_message = find_message_cb(self.orig_message_id, orig_recipient)
-            if inspect.isawaitable(orig_message):
-                orig_message = await orig_message
-
+            orig_message = await _call_callback(
+                find_message_cb, self.orig_message_id, orig_recipient
+            )
             if not orig_message:
                 status = "failed/Failure"
                 details_status = "original-message-not-found"
