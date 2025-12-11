@@ -59,16 +59,30 @@ from pyas2lib.utils import (
 logger = logging.getLogger("pyas2lib")
 
 
+def _is_event_loop_running_in_main_thread():
+    """Check if an event loop is running in the main thread."""
+    try:
+        loop = asyncio.get_running_loop()
+        # Check if loop is running in main thread
+        import threading
+
+        return threading.current_thread() is threading.main_thread()
+    except RuntimeError:
+        return False
+
+
 async def _call_callback(callback, *args):
     """
     Helper to call a callback that may be sync or async.
 
     Handles three scenarios:
     1. Sync callback called from async context (aparse called directly)
-       - Runs in a thread to avoid blocking and to support sync-only
-         operations like Django ORM
+       - If event loop is running in main thread, runs callback in a thread
+         to support sync-only operations like Django ORM
+       - Otherwise, calls directly (e.g., when parse() uses asyncio.run())
     2. Sync callback called from sync context (via parse -> aparse)
-       - Runs in a thread (same as above, since we're still in async context)
+       - Calls the callback directly since asyncio.run() creates a new
+         event loop that doesn't conflict with sync operations
     3. Async callback called from async context (aparse called directly)
        - Awaits the coroutine directly
 
@@ -83,9 +97,18 @@ async def _call_callback(callback, *args):
     if inspect.iscoroutinefunction(callback):
         return await callback(*args)
 
-    # For sync functions, run in a thread to avoid blocking the event loop
-    # and to support sync-only operations (like Django ORM)
-    return await asyncio.to_thread(callback, *args)
+    # For sync functions, check if we need to run in a thread
+    # We need to_thread when an async framework (like Django async views)
+    # is running the event loop and calling aparse directly
+    if _is_event_loop_running_in_main_thread():
+        # Event loop running in main thread means we're likely in an async
+        # framework context (Django async view, FastAPI, etc.)
+        # Run sync callback in thread to avoid blocking and allow sync DB ops
+        return await asyncio.to_thread(callback, *args)
+
+    # Event loop is not in main thread (e.g., asyncio.run() from parse())
+    # Safe to call sync callback directly
+    return callback(*args)
 
 
 @dataclass
