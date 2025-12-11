@@ -799,13 +799,17 @@ class Message:
         A synchronous wrapper for the asynchronous parse method.
         It runs the parse coroutine in an event loop and returns the result.
         """
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
             raise RuntimeError(
                 "Cannot run synchronous parse within an already running event loop, use aparse."
             )
-        return loop.run_until_complete(self.aparse(*args, **kwargs))
 
+        return asyncio.run(self.aparse(*args, **kwargs))
 
 class Mdn:
     """Class for handling AS2 MDNs. Includes functions for both
@@ -1104,12 +1108,17 @@ class Mdn:
         A synchronous wrapper for the asynchronous parse method.
         It runs the parse coroutine in an event loop and returns the result.
         """
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
             raise RuntimeError(
                 "Cannot run synchronous parse within an already running event loop, use aparse."
             )
-        return loop.run_until_complete(self.aparse(*args, **kwargs))
+
+        return asyncio.run(self.aparse(*args, **kwargs))
 
     def detect_mdn(self):
         """Function checks if the received raw message is an AS2 MDN or not.
