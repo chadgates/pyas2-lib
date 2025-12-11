@@ -358,13 +358,28 @@ wheels = [
 ]
 
 [[package]]
-name = "pyas2-lib"
-version = "0.1.0"
-source = { virtual = "." }
+name = "pyas2lib"
+version = "1.4.4"
+source = { editable = "." }
 dependencies = [
     { name = "asn1crypto" },
     { name = "oscrypto" },
     { name = "pyopenssl" },
+]
+
+[package.optional-dependencies]
+tests = [
+    { name = "black" },
+    { name = "coverage" },
+    { name = "pyflakes" },
+    { name = "pylama" },
+    { name = "pylama-pylint" },
+    { name = "pylint" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-black" },
+    { name = "pytest-cov" },
+    { name = "toml" },
 ]
 
 [package.dev-dependencies]
@@ -385,9 +400,21 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "asn1crypto", specifier = "==1.5.1" },
+    { name = "black", marker = "extra == 'tests'", specifier = "==22.6.0" },
+    { name = "coverage", marker = "extra == 'tests'", specifier = "==5.0.4" },
     { name = "oscrypto", git = "https://github.com/wbond/oscrypto.git?rev=master" },
+    { name = "pyflakes", marker = "extra == 'tests'", specifier = "==2.4.0" },
+    { name = "pylama", marker = "extra == 'tests'", specifier = "==8.3.7" },
+    { name = "pylama-pylint", marker = "extra == 'tests'", specifier = "==3.1.1" },
+    { name = "pylint", marker = "extra == 'tests'", specifier = "==2.12.1" },
     { name = "pyopenssl", specifier = ">=23.2.0" },
+    { name = "pytest", marker = "extra == 'tests'", specifier = "==7.4.4" },
+    { name = "pytest-asyncio", marker = "extra == 'tests'", specifier = "==0.21.1" },
+    { name = "pytest-black", marker = "extra == 'tests'", specifier = "==0.3.12" },
+    { name = "pytest-cov", marker = "extra == 'tests'", specifier = "==2.8.1" },
+    { name = "toml", marker = "extra == 'tests'", specifier = "==0.10.2" },
 ]
+provides-extras = ["tests"]
 
 [package.metadata.requires-dev]
 test = [
