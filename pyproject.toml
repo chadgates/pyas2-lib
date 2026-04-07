@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "asn1crypto==1.5.1",
-    "oscrypto",
+    "cryptography>=41.0.0",
     "pyopenssl>=23.2.0",
 ]
 
@@ -67,4 +67,3 @@ build-backend = "setuptools.build_meta"
 exclude = ["test*"]
 
 [tool.uv.sources]
-oscrypto = { git = "https://github.com/wbond/oscrypto.git", rev = "master" }

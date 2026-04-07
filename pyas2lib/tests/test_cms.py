@@ -2,11 +2,14 @@
 import os
 
 import pytest
-from oscrypto import asymmetric, symmetric, util
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import Cipher
+from cryptography.hazmat.decrepit.ciphers.algorithms import ARC4
 
 from asn1crypto import algos, cms as crypto_cms, core
 
-from pyas2lib.as2 import Organization
+from pyas2lib.as2 import Organization, load_certificate
 from pyas2lib import cms
 from pyas2lib.exceptions import (
     AS2Exception,
@@ -26,18 +29,27 @@ INVALID_DATA = cms.cms.ContentInfo(
 
 def _encrypted_data_with_faulty_key_algo():
     with open(os.path.join(TEST_DIR, "cert_test_public.pem"), "rb") as fp:
-        encrypt_cert = asymmetric.load_certificate(fp.read())
+        encrypt_cert = load_certificate(fp.read())
     enc_alg_list = "rc4_128_cbc".split("_")
     cipher, key_length, _ = enc_alg_list[0], enc_alg_list[1], enc_alg_list[2]
-    key = util.rand_bytes(int(key_length) // 8)
+    key = os.urandom(int(key_length) // 8)
     algorithm_id = "1.2.840.113549.3.4"
-    encrypted_content = symmetric.rc4_encrypt(key, b"data")
+    rc4_cipher = Cipher(ARC4(key), mode=None)
+    encryptor = rc4_cipher.encryptor()
+    encrypted_content = encryptor.update(b"data") + encryptor.finalize()
     enc_alg_asn1 = algos.EncryptionAlgorithm(
         {
             "algorithm": algorithm_id,
         }
     )
-    encrypted_key = asymmetric.rsa_oaep_encrypt(encrypt_cert, key)
+    encrypted_key = encrypt_cert.public_key.encrypt(
+        key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA1()),
+            algorithm=hashes.SHA1(),
+            label=None,
+        ),
+    )
     return crypto_cms.ContentInfo(
         {
             "content_type": crypto_cms.ContentType("enveloped_data"),
@@ -101,7 +113,7 @@ def test_signing():
     with open(os.path.join(TEST_DIR, "cert_test.p12"), "rb") as fp:
         sign_key = Organization.load_key(fp.read(), "test")
     with open(os.path.join(TEST_DIR, "cert_test_public.pem"), "rb") as fp:
-        verify_cert = asymmetric.load_certificate(fp.read())
+        verify_cert = load_certificate(fp.read())
 
     # Test failure of signature verification
     with pytest.raises(IntegrityError):
@@ -139,7 +151,7 @@ def test_encryption():
     with open(os.path.join(TEST_DIR, "cert_test.p12"), "rb") as fp:
         decrypt_key = Organization.load_key(fp.read(), "test")
     with open(os.path.join(TEST_DIR, "cert_test_public.pem"), "rb") as fp:
-        encrypt_cert = asymmetric.load_certificate(fp.read())
+        encrypt_cert = load_certificate(fp.read())
 
     with pytest.raises(DecryptionError):
         cms.decrypt_message(INVALID_DATA, None)

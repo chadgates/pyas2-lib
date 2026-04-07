@@ -1,11 +1,20 @@
 """Define functions related to the CMS operations such as encrypting, signature, etc."""
 import hashlib
+import os
 import zlib
 from datetime import datetime, timezone
 
 from asn1crypto import cms, core, algos
 from asn1crypto.cms import SMIMECapabilityIdentifier
-from oscrypto import asymmetric, symmetric, util
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.padding import PKCS7 as PKCS7Padding
+from cryptography.hazmat.decrepit.ciphers.algorithms import (
+    ARC4,
+    RC2,
+    TripleDES,
+)
 
 from pyas2lib.constants import DIGEST_ALGORITHMS
 from pyas2lib.exceptions import (
@@ -15,6 +24,45 @@ from pyas2lib.exceptions import (
     IntegrityError,
 )
 from pyas2lib.utils import normalize_digest_alg
+
+
+# Mapping from string digest algorithm names to cryptography hash objects
+_HASH_ALGORITHMS = {
+    "md5": hashes.MD5(),
+    "sha1": hashes.SHA1(),
+    "sha224": hashes.SHA224(),
+    "sha256": hashes.SHA256(),
+    "sha384": hashes.SHA384(),
+    "sha512": hashes.SHA512(),
+}
+
+
+def _get_hash_alg(name):
+    """Return a cryptography hash algorithm instance from a string name."""
+    alg = _HASH_ALGORITHMS.get(name)
+    if alg is None:
+        raise AS2Exception(f"Unsupported hash algorithm: {name}")
+    return alg
+
+
+def _sym_encrypt_cbc(algorithm_cls, key, data, block_size_bits):
+    """Encrypt data using a CBC mode cipher with PKCS7 padding, returning (iv, ciphertext)."""
+    iv = os.urandom(block_size_bits // 8)
+    padder = PKCS7Padding(block_size_bits).padder()
+    padded = padder.update(data) + padder.finalize()
+    cipher = Cipher(algorithm_cls(key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    return iv, ciphertext
+
+
+def _sym_decrypt_cbc(algorithm_cls, key, data, iv, block_size_bits):
+    """Decrypt CBC-mode ciphertext and remove PKCS7 padding."""
+    cipher = Cipher(algorithm_cls(key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(data) + decryptor.finalize()
+    unpadder = PKCS7Padding(block_size_bits).unpadder()
+    return unpadder.update(padded) + unpadder.finalize()
 
 
 def compress_message(data_to_compress):
@@ -82,11 +130,11 @@ def encrypt_message(
     cipher, key_length, _ = enc_alg_list[0], enc_alg_list[1], enc_alg_list[2]
 
     # Generate the symmetric encryption key and encrypt the message
-    key = util.rand_bytes(int(key_length) // 8)
+    key = os.urandom(int(key_length) // 8)
     if cipher == "tripledes":
         algorithm_id = "1.2.840.113549.3.7"
-        iv, encrypted_content = symmetric.tripledes_cbc_pkcs5_encrypt(
-            key, data_to_encrypt, None
+        iv, encrypted_content = _sym_encrypt_cbc(
+            TripleDES, key, data_to_encrypt, 64
         )
         enc_alg_asn1 = algos.EncryptionAlgorithm(
             {"algorithm": algorithm_id, "parameters": cms.OctetString(iv)}
@@ -94,8 +142,8 @@ def encrypt_message(
 
     elif cipher == "rc2":
         algorithm_id = "1.2.840.113549.3.2"
-        iv, encrypted_content = symmetric.rc2_cbc_pkcs5_encrypt(
-            key, data_to_encrypt, None
+        iv, encrypted_content = _sym_encrypt_cbc(
+            RC2, key, data_to_encrypt, 64
         )
         enc_alg_asn1 = algos.EncryptionAlgorithm(
             {
@@ -106,7 +154,9 @@ def encrypt_message(
 
     elif cipher == "rc4":
         algorithm_id = "1.2.840.113549.3.4"
-        encrypted_content = symmetric.rc4_encrypt(key, data_to_encrypt)
+        rc4_cipher = Cipher(ARC4(key), mode=None)
+        encryptor = rc4_cipher.encryptor()
+        encrypted_content = encryptor.update(data_to_encrypt) + encryptor.finalize()
         enc_alg_asn1 = algos.EncryptionAlgorithm(
             {
                 "algorithm": algorithm_id,
@@ -121,16 +171,16 @@ def encrypt_message(
         else:
             algorithm_id = "2.16.840.1.101.3.4.1.42"
 
-        iv, encrypted_content = symmetric.aes_cbc_pkcs7_encrypt(
-            key, data_to_encrypt, None
+        iv, encrypted_content = _sym_encrypt_cbc(
+            algorithms.AES, key, data_to_encrypt, 128
         )
         enc_alg_asn1 = algos.EncryptionAlgorithm(
             {"algorithm": algorithm_id, "parameters": cms.OctetString(iv)}
         )
     elif cipher == "des":
         algorithm_id = "1.3.14.3.2.7"
-        iv, encrypted_content = symmetric.des_cbc_pkcs5_encrypt(
-            key, data_to_encrypt, None
+        iv, encrypted_content = _sym_encrypt_cbc(
+            TripleDES, key, data_to_encrypt, 64
         )
         enc_alg_asn1 = algos.EncryptionAlgorithm(
             {"algorithm": algorithm_id, "parameters": cms.OctetString(iv)}
@@ -138,11 +188,19 @@ def encrypt_message(
     else:
         raise AS2Exception("Unsupported Encryption Algorithm")
 
-    # Encrypt the key and build the ASN.1 message
+    # Encrypt the key using the certificate's public key
+    pub_key = encryption_cert.public_key
     if key_enc_alg == "rsaes_pkcs1v15":
-        encrypted_key = asymmetric.rsa_pkcs1v15_encrypt(encryption_cert, key)
+        encrypted_key = pub_key.encrypt(key, padding.PKCS1v15())
     elif key_enc_alg == "rsaes_oaep":
-        encrypted_key = asymmetric.rsa_oaep_encrypt(encryption_cert, key)
+        encrypted_key = pub_key.encrypt(
+            key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA1()),
+                algorithm=hashes.SHA1(),
+                label=None,
+            ),
+        )
     else:
         raise AS2Exception(f"Unsupported Key Encryption Scheme: {key_enc_alg}")
 
@@ -212,15 +270,23 @@ def decrypt_message(encrypted_data, decryption_key):
         encrypted_key = recipient_info["encrypted_key"].native
 
         try:
+            private_key = decryption_key[0].key
             if cms.KeyEncryptionAlgorithmId(
                 key_enc_alg
             ) == cms.KeyEncryptionAlgorithmId("rsaes_pkcs1v15"):
-                key = asymmetric.rsa_pkcs1v15_decrypt(decryption_key[0], encrypted_key)
+                key = private_key.decrypt(encrypted_key, padding.PKCS1v15())
 
             elif cms.KeyEncryptionAlgorithmId(
                 key_enc_alg
             ) == cms.KeyEncryptionAlgorithmId("rsaes_oaep"):
-                key = asymmetric.rsa_oaep_decrypt(decryption_key[0], encrypted_key)
+                key = private_key.decrypt(
+                    encrypted_key,
+                    padding.OAEP(
+                        mgf=padding.MGF1(algorithm=hashes.SHA1()),
+                        algorithm=hashes.SHA1(),
+                        label=None,
+                    ),
+                )
             else:
                 raise AS2Exception(
                     f"Unsupported Key Encryption Algorithm {key_enc_alg}"
@@ -239,19 +305,21 @@ def decrypt_message(encrypted_data, decryption_key):
 
         try:
             if alg["algorithm"].native == "rc4":
-                decrypted_content = symmetric.rc4_decrypt(key, encapsulated_data)
+                rc4_cipher = Cipher(ARC4(key), mode=None)
+                decryptor = rc4_cipher.decryptor()
+                decrypted_content = decryptor.update(encapsulated_data) + decryptor.finalize()
             elif alg.encryption_cipher == "tripledes":
                 cipher = "tripledes_192_cbc"
-                decrypted_content = symmetric.tripledes_cbc_pkcs5_decrypt(
-                    key, encapsulated_data, alg.encryption_iv
+                decrypted_content = _sym_decrypt_cbc(
+                    TripleDES, key, encapsulated_data, alg.encryption_iv, 64
                 )
             elif alg.encryption_cipher == "aes":
-                decrypted_content = symmetric.aes_cbc_pkcs7_decrypt(
-                    key, encapsulated_data, alg.encryption_iv
+                decrypted_content = _sym_decrypt_cbc(
+                    algorithms.AES, key, encapsulated_data, alg.encryption_iv, 128
                 )
             elif alg.encryption_cipher == "rc2":
-                decrypted_content = symmetric.rc2_cbc_pkcs5_decrypt(
-                    key, encapsulated_data, alg["parameters"]["iv"].native
+                decrypted_content = _sym_decrypt_cbc(
+                    RC2, key, encapsulated_data, alg["parameters"]["iv"].native, 64
                 )
             else:
                 raise AS2Exception("Unsupported Encryption Algorithm")
@@ -368,11 +436,20 @@ def sign_message(
         signed_attributes = None
 
     # Generate the signature
+    hash_alg = _get_hash_alg(digest_alg)
     data_to_sign = signed_attributes.dump() if signed_attributes else data_to_sign
+    private_key = sign_key[0].key
     if sign_alg == "rsassa_pkcs1v15":
-        signature = asymmetric.rsa_pkcs1v15_sign(sign_key[0], data_to_sign, digest_alg)
+        signature = private_key.sign(data_to_sign, padding.PKCS1v15(), hash_alg)
     elif sign_alg == "rsassa_pss":
-        signature = asymmetric.rsa_pss_sign(sign_key[0], data_to_sign, digest_alg)
+        signature = private_key.sign(
+            data_to_sign,
+            padding.PSS(
+                mgf=padding.MGF1(hash_alg),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            hash_alg,
+        )
     else:
         raise AS2Exception("Unsupported Signature Algorithm")
 
@@ -489,12 +566,20 @@ def verify_message(data_to_verify, signature, verify_cert):
                 signed_data = signer["signed_attrs"].untag().dump()
 
             try:
+                hash_alg = _get_hash_alg(digest_alg)
+                pub_key = verify_cert.public_key
                 if sig_alg == "rsassa_pkcs1v15":
-                    asymmetric.rsa_pkcs1v15_verify(
-                        verify_cert, sig, signed_data, digest_alg
-                    )
+                    pub_key.verify(sig, signed_data, padding.PKCS1v15(), hash_alg)
                 elif sig_alg == "rsassa_pss":
-                    asymmetric.rsa_pss_verify(verify_cert, sig, signed_data, digest_alg)
+                    pub_key.verify(
+                        sig,
+                        signed_data,
+                        padding.PSS(
+                            mgf=padding.MGF1(hash_alg),
+                            salt_length=padding.PSS.MAX_LENGTH,
+                        ),
+                        hash_alg,
+                    )
                 else:
                     raise AS2Exception("Unsupported Signature Algorithm")
             except Exception as e:

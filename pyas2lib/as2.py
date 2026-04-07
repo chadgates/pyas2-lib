@@ -10,7 +10,14 @@ from email import message_from_bytes as parse_mime
 from email import utils as email_utils
 from email.mime.multipart import MIMEMultipart
 
-from oscrypto import asymmetric
+from asn1crypto import x509 as asn1_x509
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    pkcs12,
+    load_pem_private_key,
+    load_der_private_key,
+)
+from cryptography.x509 import load_pem_x509_certificate, load_der_x509_certificate
 
 from pyas2lib.cms import (
     compress_message,
@@ -55,6 +62,51 @@ from pyas2lib.utils import (
 )
 
 logger = logging.getLogger("pyas2lib")
+
+
+class CryptoPrivateKey:
+    """Wrapper around a cryptography private key object."""
+
+    def __init__(self, key):
+        self._key = key
+
+    @property
+    def key(self):
+        return self._key
+
+
+class CryptoCertificate:
+    """Wrapper around a cryptography certificate that provides an .asn1 property
+    for building CMS ASN.1 structures using asn1crypto."""
+
+    def __init__(self, cert):
+        self._cert = cert
+        self._asn1 = None
+
+    @property
+    def cert(self):
+        return self._cert
+
+    @property
+    def public_key(self):
+        return self._cert.public_key()
+
+    @property
+    def asn1(self):
+        if self._asn1 is None:
+            self._asn1 = asn1_x509.Certificate.load(
+                self._cert.public_bytes(Encoding.DER)
+            )
+        return self._asn1
+
+
+def load_certificate(cert_data):
+    """Load a certificate from PEM or DER data and return a CryptoCertificate wrapper."""
+    try:
+        cert = load_pem_x509_certificate(cert_data)
+    except (ValueError, Exception):
+        cert = load_der_x509_certificate(cert_data)
+    return CryptoCertificate(cert)
 
 
 @dataclass
@@ -104,34 +156,35 @@ class Organization:
     @staticmethod
     def load_key(key_str: bytes, key_pass: str):
         """Function to load password protected key file in p12 or pem format."""
+        key_pass_bytes = key_pass.encode() if isinstance(key_pass, str) else key_pass
 
         try:
             # First try to parse as a p12 file
-            key, cert, _ = asymmetric.load_pkcs12(key_str, key_pass)
-        except ValueError as e:
-            # If it fails due to invalid password raise error here
-            if e.args[0] == "Password provided is invalid":
+            private_key, certificate, _ = pkcs12.load_key_and_certificates(
+                key_str, key_pass_bytes
+            )
+        except (ValueError, Exception) as e:
+            error_msg = str(e)
+            if "password" in error_msg.lower() or "mac" in error_msg.lower():
                 raise AS2Exception("Password not valid for Private Key.") from e
 
             # if not try to parse as a pem file
-            key, cert = None, None
+            private_key, certificate = None, None
             for kc in split_pem(key_str):
                 try:
-                    cert = asymmetric.load_certificate(kc)
-                except (ValueError, TypeError) as e:
+                    certificate = load_pem_x509_certificate(kc)
+                except (ValueError, Exception):
                     try:
-                        key = asymmetric.load_private_key(kc, key_pass)
-                    except OSError:
+                        private_key = load_pem_private_key(kc, key_pass_bytes)
+                    except (ValueError, Exception) as inner_e:
                         raise AS2Exception(
                             "Invalid Private Key or password is not correct."
-                        ) from e
+                        ) from inner_e
 
-        if not key or not cert:
+        if not private_key or not certificate:
             raise AS2Exception("Invalid Private key file or Public key not included.")
 
-        return key, cert
-
-
+        return CryptoPrivateKey(private_key), CryptoCertificate(certificate)
 @dataclass
 class Partner:
     """
@@ -265,7 +318,7 @@ class Partner:
                 cert, trust_roots, ignore_self_signed=self.ignore_self_signed
             )
 
-        return asymmetric.load_certificate(self.verify_cert)
+        return load_certificate(self.verify_cert)
 
     def load_encrypt_cert(self):
         """Load the encryption certificate of the partner and returned the parsed cert."""
@@ -284,7 +337,7 @@ class Partner:
                 cert, trust_roots, ignore_self_signed=self.ignore_self_signed
             )
 
-        return asymmetric.load_certificate(self.encrypt_cert)
+        return load_certificate(self.encrypt_cert)
 
 
 class Message:
